@@ -21,7 +21,11 @@ import type { AstRoot, AstNodeLike } from '../types.js';
 import type { NamedMap } from '../block.js';
 import { isNamedMap, isAstNodeLike } from '../types.js';
 import type { ScopeContext, SchemaContext } from './scope.js';
-import { collectDiagnostics, dispatchAstChildren } from './ast-walkers.js';
+import {
+  collectDiagnostics,
+  dispatchAstChildren,
+  recurseAstChildren,
+} from './ast-walkers.js';
 
 /** A branded string that carries value type `T` at the type level. */
 export type StoreKey<T> = string & { readonly __type: T };
@@ -250,6 +254,7 @@ export class LintEngine {
   private readonly passes = new Map<string, LintPass>();
   private readonly disabled = new Set<string>();
   private readonly source: string;
+  private readonly ownedDiagnostics = new WeakSet<Diagnostic>();
 
   constructor(options?: { passes?: readonly LintPass[]; source?: string }) {
     this.source = options?.source ?? 'lint';
@@ -286,13 +291,17 @@ export class LintEngine {
   /**
    * Run all enabled passes against the AST.
    *
-   * Mutates the AST by clearing diagnostics with this engine's source tag
-   * during the walk phase, ensuring re-runs produce fresh results.
+   * Clears diagnostics produced by this engine on earlier runs, plus those
+   * with its source tag, before any pass hooks run. Pass diagnostics keep
+   * their original source tags; unrelated diagnostics are preserved.
    */
   run(
     root: AstRoot,
     ctx: SchemaContext
   ): { diagnostics: Diagnostic[]; store: PassStore } {
+    const existingDiagnostics = new Set<Diagnostic>();
+    this.prepareDiagnostics(root, existingDiagnostics, new Set());
+    let nodeDiagnostics: Diagnostic[] = [];
     const store = new PassStore();
     store.set(schemaContextKey, ctx);
     const systemDiagnostics: Diagnostic[] = [];
@@ -302,104 +311,140 @@ export class LintEngine {
       p => !this.disabled.has(p.id)
     );
 
-    // Phase 1: Init
-    for (const pass of enabled) {
-      if (pass.init) {
+    try {
+      // Phase 1: Init
+      for (const pass of enabled) {
+        if (pass.init) {
+          try {
+            pass.init();
+          } catch (error: unknown) {
+            failed.add(pass.id);
+            systemDiagnostics.push(
+              this.systemDiagnostic(
+                `Pass '${pass.id}' init failed: ${error instanceof Error ? error.message : String(error)}`,
+                'lint-pass-error'
+              )
+            );
+          }
+        }
+      }
+
+      // Phase 2: Walk
+      const active = enabled.filter(p => !failed.has(p.id));
+      const sets = partitionPasses(active);
+
+      this.dispatchTargetedHooks(root, sets, failed, systemDiagnostics);
+
+      this.walkNode(
+        root,
+        sets,
+        {},
+        '',
+        undefined,
+        new Set(),
+        failed,
+        systemDiagnostics
+      );
+
+      // Phase 3: Finalize (toposorted)
+      const finalizePasses = active.filter(p => p.finalize);
+      const finalizeOrder = this.sortFinalize(finalizePasses, failed);
+      for (const pass of finalizeOrder) {
+        if (failed.has(pass.id)) continue;
+
+        const missingDep = pass.finalizeAfter?.find(dep => !store.has(dep));
+        if (missingDep) {
+          failed.add(pass.id);
+          systemDiagnostics.push(
+            this.systemDiagnostic(
+              `Pass '${pass.id}' skipped: required data '${missingDep}' not available`,
+              'lint-pass-skipped'
+            )
+          );
+          continue;
+        }
+
         try {
-          pass.init();
+          pass.finalize!(store, root);
         } catch (error: unknown) {
           failed.add(pass.id);
           systemDiagnostics.push(
             this.systemDiagnostic(
-              `Pass '${pass.id}' init failed: ${error instanceof Error ? error.message : String(error)}`,
+              `Pass '${pass.id}' finalize failed: ${error instanceof Error ? error.message : String(error)}`,
               'lint-pass-error'
             )
           );
         }
       }
-    }
 
-    // Phase 2: Walk
-    const active = enabled.filter(p => !failed.has(p.id));
-    const sets = partitionPasses(active);
+      // Phase 4: Run (requires-gated)
+      const runPasses = active.filter(p => p.run);
+      for (const pass of runPasses) {
+        if (failed.has(pass.id)) continue;
 
-    this.dispatchTargetedHooks(root, sets, failed, systemDiagnostics);
+        const missingKey = pass.requires?.find(key => !store.has(key));
+        if (missingKey) {
+          systemDiagnostics.push(
+            this.systemDiagnostic(
+              `Pass '${pass.id}' skipped: required data '${missingKey}' not available`,
+              'lint-pass-skipped'
+            )
+          );
+          continue;
+        }
 
-    this.walkNode(
-      root,
-      sets,
-      {},
-      '',
-      undefined,
-      new Set(),
-      failed,
-      systemDiagnostics
-    );
-
-    // Phase 3: Finalize (toposorted)
-    const finalizePasses = active.filter(p => p.finalize);
-    const finalizeOrder = this.sortFinalize(finalizePasses, failed);
-    for (const pass of finalizeOrder) {
-      if (failed.has(pass.id)) continue;
-
-      const missingDep = pass.finalizeAfter?.find(dep => !store.has(dep));
-      if (missingDep) {
-        failed.add(pass.id);
-        systemDiagnostics.push(
-          this.systemDiagnostic(
-            `Pass '${pass.id}' skipped: required data '${missingDep}' not available`,
-            'lint-pass-skipped'
-          )
-        );
-        continue;
+        try {
+          pass.run!(store, root);
+        } catch (error: unknown) {
+          systemDiagnostics.push(
+            this.systemDiagnostic(
+              `Pass '${pass.id}' run failed: ${error instanceof Error ? error.message : String(error)}`,
+              'lint-pass-error'
+            )
+          );
+        }
       }
-
-      try {
-        pass.finalize!(store, root);
-      } catch (error: unknown) {
-        failed.add(pass.id);
-        systemDiagnostics.push(
-          this.systemDiagnostic(
-            `Pass '${pass.id}' finalize failed: ${error instanceof Error ? error.message : String(error)}`,
-            'lint-pass-error'
-          )
-        );
+    } finally {
+      // Keep ownership even when dependency resolution aborts the run.
+      nodeDiagnostics = collectDiagnostics(root);
+      for (const diagnostic of nodeDiagnostics) {
+        if (!existingDiagnostics.has(diagnostic)) {
+          this.ownedDiagnostics.add(diagnostic);
+        }
       }
     }
 
-    // Phase 4: Run (requires-gated)
-    const runPasses = active.filter(p => p.run);
-    for (const pass of runPasses) {
-      if (failed.has(pass.id)) continue;
-
-      const missingKey = pass.requires?.find(key => !store.has(key));
-      if (missingKey) {
-        systemDiagnostics.push(
-          this.systemDiagnostic(
-            `Pass '${pass.id}' skipped: required data '${missingKey}' not available`,
-            'lint-pass-skipped'
-          )
-        );
-        continue;
-      }
-
-      try {
-        pass.run!(store, root);
-      } catch (error: unknown) {
-        systemDiagnostics.push(
-          this.systemDiagnostic(
-            `Pass '${pass.id}' run failed: ${error instanceof Error ? error.message : String(error)}`,
-            'lint-pass-error'
-          )
-        );
-      }
-    }
-
-    const nodeDiagnostics = collectDiagnostics(root);
     return {
       diagnostics: [...nodeDiagnostics, ...systemDiagnostics],
       store,
     };
+  }
+
+  /** Clear stale diagnostics and remember unrelated ones before any hooks run. */
+  private prepareDiagnostics(
+    value: unknown,
+    existingDiagnostics: Set<Diagnostic>,
+    visited: Set<unknown>
+  ): void {
+    if (!value || typeof value !== 'object' || visited.has(value)) return;
+    visited.add(value);
+
+    if (isAstNodeLike(value) && Array.isArray(value.__diagnostics)) {
+      value.__diagnostics = value.__diagnostics.filter(diagnostic => {
+        if (
+          this.ownedDiagnostics.has(diagnostic) ||
+          diagnostic.source === this.source
+        ) {
+          return false;
+        }
+        existingDiagnostics.add(diagnostic);
+        return true;
+      });
+    }
+
+    recurseAstChildren(value, (_key, child) => {
+      this.prepareDiagnostics(child, existingDiagnostics, visited);
+    });
   }
 
   /**
@@ -433,10 +478,7 @@ export class LintEngine {
     }
   }
 
-  /**
-   * Recursive walk dispatching to all pass visitors.
-   * Also clears lint diagnostics from previous runs.
-   */
+  /** Recursive walk dispatching to all pass visitors. */
   private walkNode(
     value: unknown,
     sets: PassSets,
@@ -469,14 +511,6 @@ export class LintEngine {
     }
 
     if (!isAstNodeLike(value)) return;
-
-    // Clear lint diagnostics from previous run
-    const diags = value.__diagnostics;
-    if (Array.isArray(diags)) {
-      value.__diagnostics = diags.filter(
-        (d: Diagnostic) => d.source !== this.source
-      );
-    }
 
     for (const p of sets.enterNode) {
       if (failed.has(p.id)) continue;
